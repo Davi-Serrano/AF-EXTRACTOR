@@ -40,6 +40,16 @@ def br_num_to_dot(s: str) -> Optional[str]:
     except InvalidOperation:
         return None
 
+def extract_prazo_curto(raw: str) -> Optional[str]:
+    """Reduz um texto de prazo (ex.: 'A PRAZO - 5 DIAS ÚTEIS - CONFORME TERMO
+    DE REFERÊNCIA') para a forma curta 'N dias úteis'/'N dias corridos', usada
+    dentro de frases prontas do template (ex.: '...no prazo máximo de até {}')."""
+    m = re.search(r"(\d+)\s*dias?\s*(úteis|uteis|corridos)", raw or "", re.IGNORECASE)
+    if not m:
+        return None
+    tipo = "dias úteis" if "teis" in m.group(2).lower() else "dias corridos"
+    return f"{m.group(1)} {tipo}"
+
 def ddmmyyyy_to_iso(s: str) -> Optional[str]:
     m = re.search(r"\b(\d{2})/(\d{2})/(\d{4})\b", s or "")
     if not m:
@@ -170,6 +180,9 @@ def extract_fields(text: str) -> Dict[str, Any]:
         "data_af": None,
         "valor_total_pedido": None,
         "empenho": None,
+        "prazo_entrega": None,
+        "prazo_do_tr": None,
+        "data_prevista_entrega": None,
         "itens": [],
     }
 
@@ -237,6 +250,32 @@ def extract_fields(text: str) -> Dict[str, Any]:
             v = prev_line(lines, idx)
             if v and not re.search(r"\bAUTORIZAMOS A EMPRESA\b", v, re.IGNORECASE):
                 data["contratada_nome"] = v
+            break
+
+    # Data Prevista de Entrega: -> valor vem antes (dd/mm/aaaa)
+    idx_data_prevista_entrega: Optional[int] = None
+    for idx, ln in enumerate(lines):
+        if ln.upper() == "DATA PREVISTA DE ENTREGA:":
+            idx_data_prevista_entrega = idx
+            v = prev_line(lines, idx)
+            iso = ddmmyyyy_to_iso(v or "")
+            if iso:
+                data["data_prevista_entrega"] = iso
+            break
+
+    # Prazo de Entrega: -> texto vem antes, podendo ocupar varias linhas
+    # entre o rotulo "Data Prevista de Entrega:" (se achado) e este rotulo
+    for idx, ln in enumerate(lines):
+        if ln.upper() == "PRAZO DE ENTREGA:":
+            start = (
+                idx_data_prevista_entrega + 1
+                if idx_data_prevista_entrega is not None
+                else max(0, idx - 3)
+            )
+            valor = normalize_spaces(" ".join(lines[start:idx]))
+            if valor:
+                data["prazo_entrega"] = valor
+                data["prazo_do_tr"] = extract_prazo_curto(valor) or valor
             break
 
     # CPF/CNPJ: -> valor vem antes (CNPJ da contratada)
