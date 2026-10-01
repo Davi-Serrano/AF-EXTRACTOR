@@ -40,16 +40,6 @@ def br_num_to_dot(s: str) -> Optional[str]:
     except InvalidOperation:
         return None
 
-def extract_prazo_curto(raw: str) -> Optional[str]:
-    """Reduz um texto de prazo (ex.: 'A PRAZO - 5 DIAS ÚTEIS - CONFORME TERMO
-    DE REFERÊNCIA') para a forma curta 'N dias úteis'/'N dias corridos', usada
-    dentro de frases prontas do template (ex.: '...no prazo máximo de até {}')."""
-    m = re.search(r"(\d+)\s*dias?\s*(úteis|uteis|corridos)", raw or "", re.IGNORECASE)
-    if not m:
-        return None
-    tipo = "dias úteis" if "teis" in m.group(2).lower() else "dias corridos"
-    return f"{m.group(1)} {tipo}"
-
 def ddmmyyyy_to_iso(s: str) -> Optional[str]:
     m = re.search(r"\b(\d{2})/(\d{2})/(\d{4})\b", s or "")
     if not m:
@@ -217,7 +207,6 @@ def extract_fields(text: str) -> Dict[str, Any]:
         "valor_total_pedido": None,
         "empenho": None,
         "prazo_entrega": None,
-        "prazo_do_tr": None,
         "data_prevista_entrega": None,
         "itens": [],
     }
@@ -311,7 +300,6 @@ def extract_fields(text: str) -> Dict[str, Any]:
             valor = normalize_spaces(" ".join(lines[start:idx]))
             if valor:
                 data["prazo_entrega"] = valor
-                data["prazo_do_tr"] = extract_prazo_curto(valor) or valor
             break
 
     # CPF/CNPJ: -> valor vem antes (CNPJ da contratada)
