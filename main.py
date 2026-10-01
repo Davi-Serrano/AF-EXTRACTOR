@@ -95,6 +95,24 @@ RX_QTD = re.compile(r"^\d[\d\.]*,\d{1,4}$")
 RX_UM = re.compile(r"^[A-Za-z]{1,6}$")
 RX_ITEM_CODE = re.compile(r"^\d{1,3}\.\d{4}$")
 
+TITULO_ITEM_STOP_LABELS = {
+    "MARCA:",
+    "OBSERVAÇÃO:",
+    "DESCRIÇÃO:",
+    "AUTORIZAÇÃO DE FORNECIMENTO",
+}
+
+def parece_continuar_titulo_item(ln: str) -> bool:
+    up = ln.upper()
+    if up in TITULO_ITEM_STOP_LABELS:
+        return False
+    if "CENTRO DE CUSTO" in up or "PRODUTO/SERVIÇO" in up:
+        return False
+    # Nome de produto nessas AFs vem sempre em maiusculas; qualquer linha com
+    # minuscula e cabecalho/rodape de pagina do PDF ("Vl. Líquido", "Sistema
+    # CECAM", "Emitido por:", enderecos, etc.), nao faz parte do nome do item.
+    return ln == up
+
 def extract_items(lines: List[str]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     i = 0
@@ -124,7 +142,25 @@ def extract_items(lines: List[str]) -> List[Dict[str, Any]]:
                     and RX_ITEM_CODE.match(codigo)
                     and dash == "-"
                 ):
-                    descricao = normalize_spaces(" ".join(desc_lines))
+                    # O nome curto do item vem logo depois do codigo/traco
+                    # (ex.: "TONER BROTHER TN 419BK PRETO"), ate achar o
+                    # proximo rotulo. Preferimos esse nome curto ao paragrafo
+                    # gigante de "DESCRIÇÃO:" (que e so texto de especificacao).
+                    # Limite de linhas como rede de seguranca contra texto de
+                    # rodape/cabecalho de pagina que escape da heuristica.
+                    titulo_lines: List[str] = []
+                    k = j + 6
+                    while (
+                        k < len(lines)
+                        and len(titulo_lines) < 10
+                        and parece_continuar_titulo_item(lines[k])
+                    ):
+                        titulo_lines.append(lines[k])
+                        k += 1
+
+                    descricao = normalize_spaces(
+                        " ".join(titulo_lines)
+                    ) or normalize_spaces(" ".join(desc_lines))
 
                     items.append(
                         {
@@ -137,7 +173,7 @@ def extract_items(lines: List[str]) -> List[Dict[str, Any]]:
                         }
                     )
 
-                    i = j + 6
+                    i = k
                     break
 
             desc_lines.append(lines[j])
@@ -305,11 +341,18 @@ def extract_fields(text: str) -> Dict[str, Any]:
                 empenho_found = found[0]
             break
 
-    # fallback: se não achou pelo cabeçalho, procura o primeiro NNN/AAAA perto de "Centro de Custo"
+    # fallback: procura "Centro de Custo" perto de "Empenho"/"Dotação".
+    # O documento pode ter mais de uma ocorrência de "Centro de Custo"
+    # (ex.: uma no cabeçalho da lista de itens, sem relação com o empenho) -
+    # por isso não pode parar na primeira, só na que de fato é a tabela
+    # financeira (tem "Empenho"/"Dotação" por perto).
     if not empenho_found:
         for idx, ln in enumerate(lines):
             if "CENTRO DE CUSTO" in ln.upper():
                 blob = window_text(lines, idx, radius=6)
+                blob_up = blob.upper()
+                if "EMPENHO" not in blob_up or "DOTA" not in blob_up:
+                    continue
                 found = re.findall(r"\b(\d{1,6}/\d{4})\b", blob)
                 if found:
                     empenho_found = found[0]
