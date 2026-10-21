@@ -65,6 +65,56 @@ def iter_clean_lines(text: str) -> List[str]:
             out.append(ln)
     return out
 
+# Alguns PDFs saem do pypdf com valor e rotulo colados na mesma linha, ex.:
+# "29/04/2026Data:151/2026Pedido (Nº/Ano):". Quebramos nesses rotulos para cair
+# no mesmo formato "valor / rotulo" (uma coisa por linha) que o resto do
+# extrator espera. Ordem importa: rotulos mais longos primeiro.
+_GLUED_LABELS = [
+    "Descrição do Objeto:",
+    "Data Prevista de Entrega:",
+    "Modo de Fornecimento:",
+    "Local de Entrega:",
+    "Prazo de Entrega:",
+    "Nome/Razão Social:",
+    "Data Autorização:",
+    "Pedido (Nº/Ano):",
+    "Ata R. Preço:",
+    "Tipo Objeto:",
+    "Justificativa:",
+    "Responsável:",
+    "Observação:",
+    "Modalidade:",
+    "Endereço:",
+    "Proc. Adm.:",
+    "CPF/CNPJ:",
+    "Nº/Ano:",
+    "Objeto:",
+    "Data:",
+]
+_RX_GLUED_LABEL = re.compile("(" + "|".join(re.escape(l) for l in _GLUED_LABELS) + ")")
+# Linha de item colada: total + unitario + qtd + UM + codigo + " - " + nome
+_RX_GLUED_ITEM_ROW = re.compile(
+    r"^(\d[\d\.]*,\d{2})(\d[\d\.]*,\d{4})(\d[\d\.]*,\d{1,4})([^\W\d_]{1,6})(\d{1,3}\.\d{4})\s*-\s*(.*)$"
+)
+# Dotacao orcamentaria colada no numero do empenho: "...3.3.90.30.00211/2026"
+_RX_GLUED_EMPENHO = re.compile(
+    r"(\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{3}\.\d{4}\.\d{4}\.\d\.\d\.\d{2}\.\d{2}\.\d{2})(\d{1,6}/\d{4})"
+)
+
+def normalize_glued_text(text: str) -> str:
+    text = _RX_GLUED_LABEL.sub(r"\n\1\n", text or "")
+    text = re.sub(r"(\d)(Total Pedido)", r"\1\n\2", text)
+    text = _RX_GLUED_EMPENHO.sub(r"\1\n\2", text)
+
+    out: List[str] = []
+    for raw in text.split("\n"):
+        m = _RX_GLUED_ITEM_ROW.match(raw.strip())
+        if m:
+            out.extend([m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), "-", m.group(6)])
+        else:
+            out.append(raw)
+    return "\n".join(out)
+
 def prev_line(lines: List[str], i: int) -> Optional[str]:
     if i <= 0:
         return None
@@ -82,19 +132,16 @@ def window_text(lines: List[str], center: int, radius: int = 3) -> str:
 RX_MONEY_2 = re.compile(r"^\d[\d\.]*,\d{2}$")
 RX_MONEY_2_4 = re.compile(r"^\d[\d\.]*,\d{2,4}$")
 RX_QTD = re.compile(r"^\d[\d\.]*,\d{1,4}$")
-RX_UM = re.compile(r"^[A-Za-z]{1,6}$")
+RX_UM = re.compile(r"^[^\W\d_]{1,6}$")  # letras, inclusive acentuadas (ex.: PÇ)
 RX_ITEM_CODE = re.compile(r"^\d{1,3}\.\d{4}$")
+# N/AAAA que nao seja pedaco de uma data (dd/mm/aaaa)
+RX_EMPENHO_NUM = re.compile(r"(?<![\d/])(\d{1,6}/\d{4})(?![\d/])")
 
-TITULO_ITEM_STOP_LABELS = {
-    "MARCA:",
-    "OBSERVAÇÃO:",
-    "DESCRIÇÃO:",
-    "AUTORIZAÇÃO DE FORNECIMENTO",
-}
+TITULO_ITEM_STOP_PREFIXES = ("MARCA:", "OBSERVAÇÃO:", "DESCRIÇÃO:")
 
 def parece_continuar_titulo_item(ln: str) -> bool:
     up = ln.upper()
-    if up in TITULO_ITEM_STOP_LABELS:
+    if up.startswith(TITULO_ITEM_STOP_PREFIXES) or up == "AUTORIZAÇÃO DE FORNECIMENTO":
         return False
     if "CENTRO DE CUSTO" in up or "PRODUTO/SERVIÇO" in up:
         return False
@@ -104,72 +151,54 @@ def parece_continuar_titulo_item(ln: str) -> bool:
     return ln == up
 
 def extract_items(lines: List[str]) -> List[Dict[str, Any]]:
+    # Varre o texto inteiro atras do bloco numerico de cada item (valor total,
+    # valor unitario, quantidade, unidade, codigo e "-"). Nao depende do
+    # rotulo "DESCRIÇÃO:", que nem sempre vem antes do bloco (o primeiro item
+    # de uma pagina costuma aparecer antes de qualquer "DESCRIÇÃO:").
     items: List[Dict[str, Any]] = []
-    i = 0
 
-    while i < len(lines):
-        if lines[i].upper() != "DESCRIÇÃO:":
-            i += 1
+    for j in range(len(lines) - 5):
+        vl_total, vl_unit, qtd, um, codigo, dash = lines[j : j + 6]
+
+        if not (
+            RX_MONEY_2.match(vl_total)
+            and RX_MONEY_2_4.match(vl_unit)
+            and RX_QTD.match(qtd)
+            and RX_UM.match(um)
+            and RX_ITEM_CODE.match(codigo)
+            and dash == "-"
+        ):
             continue
 
-        desc_lines: List[str] = []
-        j = i + 1
+        # O nome curto do item vem logo depois do codigo/traco
+        # (ex.: "TONER BROTHER TN 419BK PRETO"), ate achar o proximo rotulo.
+        # Preferimos esse nome curto ao paragrafo gigante de "DESCRIÇÃO:" (que
+        # e so texto de especificacao). Limite de linhas como rede de seguranca
+        # contra texto de rodape/cabecalho de pagina que escape da heuristica.
+        titulo_lines: List[str] = []
+        k = j + 6
+        while (
+            k < len(lines)
+            and len(titulo_lines) < 10
+            and parece_continuar_titulo_item(lines[k])
+        ):
+            titulo_lines.append(lines[k])
+            k += 1
 
-        while j < len(lines):
-            if j + 5 < len(lines):
-                vl_total = lines[j]
-                vl_unit = lines[j + 1]
-                qtd = lines[j + 2]
-                um = lines[j + 3]
-                codigo = lines[j + 4]
-                dash = lines[j + 5]
+        item = {
+            "item_codigo": codigo,
+            "item_descricao": normalize_spaces(" ".join(titulo_lines))
+            or f"Item {codigo}",
+            "item_um": um.upper(),
+            "item_quantidade": br_num_to_dot(qtd),
+            "item_valor_unitario": br_num_to_dot(vl_unit),
+            "item_valor_total": br_num_to_dot(vl_total),
+        }
 
-                if (
-                    RX_MONEY_2.match(vl_total)
-                    and RX_MONEY_2_4.match(vl_unit)
-                    and RX_QTD.match(qtd)
-                    and RX_UM.match(um)
-                    and RX_ITEM_CODE.match(codigo)
-                    and dash == "-"
-                ):
-                    # O nome curto do item vem logo depois do codigo/traco
-                    # (ex.: "TONER BROTHER TN 419BK PRETO"), ate achar o
-                    # proximo rotulo. Preferimos esse nome curto ao paragrafo
-                    # gigante de "DESCRIÇÃO:" (que e so texto de especificacao).
-                    # Limite de linhas como rede de seguranca contra texto de
-                    # rodape/cabecalho de pagina que escape da heuristica.
-                    titulo_lines: List[str] = []
-                    k = j + 6
-                    while (
-                        k < len(lines)
-                        and len(titulo_lines) < 10
-                        and parece_continuar_titulo_item(lines[k])
-                    ):
-                        titulo_lines.append(lines[k])
-                        k += 1
-
-                    descricao = normalize_spaces(
-                        " ".join(titulo_lines)
-                    ) or normalize_spaces(" ".join(desc_lines))
-
-                    items.append(
-                        {
-                            "item_codigo": codigo,
-                            "item_descricao": descricao,
-                            "item_um": um.upper(),
-                            "item_quantidade": br_num_to_dot(qtd),
-                            "item_valor_unitario": br_num_to_dot(vl_unit),
-                            "item_valor_total": br_num_to_dot(vl_total),
-                        }
-                    )
-
-                    i = k
-                    break
-
-            desc_lines.append(lines[j])
-            j += 1
-        else:
-            i += 1
+        # O mesmo item pode aparecer duas vezes no texto quando atravessa a
+        # quebra de pagina; ficamos so com a ultima ocorrencia.
+        items = [it for it in items if it != item]
+        items.append(item)
 
     return items
 
@@ -193,7 +222,7 @@ def sum_items_total(items: List[Dict[str, Any]]) -> Optional[str]:
 # Field extractor
 # -----------------------------
 def extract_fields(text: str) -> Dict[str, Any]:
-    lines = iter_clean_lines(text)
+    lines = iter_clean_lines(normalize_glued_text(text))
     joined = "\n".join(lines)
 
     data: Dict[str, Any] = {
@@ -299,7 +328,7 @@ def extract_fields(text: str) -> Dict[str, Any]:
             )
             valor = normalize_spaces(" ".join(lines[start:idx]))
             if valor:
-                data["prazo_entrega"] = valor
+                data["prazo_entrega"] = valor.rstrip(" -")
             break
 
     # CPF/CNPJ: -> valor vem antes (CNPJ da contratada)
@@ -323,7 +352,7 @@ def extract_fields(text: str) -> Dict[str, Any]:
         # "Empenho Dotação Orçamentária Dest. Recurso Centro de Custo Saldo"
         if ("EMPENHO" in up) and ("DOTA" in up) and ("CENTRO" in up or "CUSTO" in up):
             blob = window_text(lines, idx, radius=4)
-            found = re.findall(r"\b(\d{1,6}/\d{4})\b", blob)
+            found = RX_EMPENHO_NUM.findall(blob)
             if found:
                 # pega o primeiro (normalmente é o empenho)
                 empenho_found = found[0]
@@ -341,7 +370,7 @@ def extract_fields(text: str) -> Dict[str, Any]:
                 blob_up = blob.upper()
                 if "EMPENHO" not in blob_up or "DOTA" not in blob_up:
                     continue
-                found = re.findall(r"\b(\d{1,6}/\d{4})\b", blob)
+                found = RX_EMPENHO_NUM.findall(blob)
                 if found:
                     empenho_found = found[0]
                 break
