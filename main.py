@@ -134,6 +134,7 @@ RX_MONEY_2_4 = re.compile(r"^\d[\d\.]*,\d{2,4}$")
 RX_QTD = re.compile(r"^\d[\d\.]*,\d{1,4}$")
 RX_UM = re.compile(r"^[^\W\d_]{1,6}$")  # letras, inclusive acentuadas (ex.: PÇ)
 RX_ITEM_CODE = re.compile(r"^\d{1,3}\.\d{4}$")
+RX_MEDIDA = re.compile(r"^\d+(?:[.,]\d+)?\s?(?:kg|g|mg|ml|l|lt|cm|mm|m)\.?$", re.IGNORECASE)
 # N/AAAA que nao seja pedaco de uma data (dd/mm/aaaa)
 RX_EMPENHO_NUM = re.compile(r"(?<![\d/])(\d{1,6}/\d{4})(?![\d/])")
 
@@ -145,6 +146,10 @@ def parece_continuar_titulo_item(ln: str) -> bool:
         return False
     if "CENTRO DE CUSTO" in up or "PRODUTO/SERVIÇO" in up:
         return False
+    # Medida colada ao numero (ex.: "200g", "500ml") faz parte do nome mesmo
+    # tendo minuscula.
+    if RX_MEDIDA.match(ln):
+        return True
     # Nome de produto nessas AFs vem sempre em maiusculas; qualquer linha com
     # minuscula e cabecalho/rodape de pagina do PDF ("Vl. Líquido", "Sistema
     # CECAM", "Emitido por:", enderecos, etc.), nao faz parte do nome do item.
